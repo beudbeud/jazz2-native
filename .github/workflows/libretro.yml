@@ -1,0 +1,73 @@
+name: 'Libretro'
+
+on:
+  push:
+    branches:
+      - 'master'
+  pull_request:
+    types: [ opened, synchronize ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Build:
+    strategy:
+      fail-fast: false
+      matrix:
+        OS: [ ubuntu-22.04, windows-2022, macos-latest ]
+        RHI: [ Software, OpenGL ]
+        include:
+        - OS: ubuntu-22.04
+          Platform: Linux_x64
+          CorePath: ./_build/jazz2_libretro.so
+        - OS: windows-2022
+          Platform: Windows_x64
+          CorePath: ./_build/Release/jazz2_libretro.dll
+          ExtraArgs: '-A x64'
+        - OS: macos-latest
+          Platform: MacOS_ARM64
+          CorePath: ./_build/jazz2_libretro.dylib
+          ExtraArgs: '-D NCINE_WITH_VORBIS=OFF'
+
+    runs-on: ${{ matrix.OS }}
+
+    steps:
+    - name: 'Checkout Repository'
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - if: runner.os == 'Linux'
+      name: 'Create Build Environment'
+      run: |
+        sudo apt update -y
+        sudo apt install -y cmake curl g++ libgl1-mesa-dev libopenmpt-dev libcurl4-openssl-dev
+
+    - name: 'Configure CMake'
+      shell: bash
+      run: |
+        rm -f ./Content/Translations/*.po
+
+        cmake -B ./_build/ -D CMAKE_BUILD_TYPE=Release -D NCINE_BUILD_LIBRETRO=ON -D NCINE_PREFERRED_RHI=${{ matrix.RHI }} -D NCINE_STRIP_BINARIES=ON ${{ matrix.ExtraArgs }}
+
+    - name: 'Build'
+      shell: bash
+      run: |
+        cmake --build ./_build/ --config Release --parallel
+
+    - name: 'Create Package'
+      shell: bash
+      run: |
+        mkdir ./_package/
+        cp -f ${{ matrix.CorePath }} ./_package/
+        cp -f -r ./Content/ ./_package/Content/
+        cp -f ./LICENSE ./_package/LICENSE
+
+    - name: 'Upload Package'
+      uses: actions/upload-artifact@v7
+      with:
+        name: Jazz2_${{ matrix.Platform }}_Libretro${{ matrix.RHI != 'Software' && format('_{0}', matrix.RHI) || '' }}
+        path: ./_package/
