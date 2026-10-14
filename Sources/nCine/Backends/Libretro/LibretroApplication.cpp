@@ -5,6 +5,7 @@
 #include "LibretroGfxDevice.h"
 #include "LibretroInputManager.h"
 #include "../../IAppEventHandler.h"
+#include "../../Threading/Thread.h"
 
 namespace nCine
 {
@@ -49,8 +50,14 @@ namespace nCine::Backends
 
 		// Pacing is normally the frontend's job (vsync or audio sync), but the engine steps a
 		// fixed 1/fps per retro_run, so an unthrottled frontend would fast-forward the game:
-		// keep the engine's own frame limiter as a backstop. It is bypassed automatically
-		// while the frontend reports fast-forwarding (see retro_run).
+		// RunFrame() keeps a backstop of its own, bypassed automatically while the frontend
+		// reports fast-forwarding (see retro_run). The engine's limiter (Application::Step())
+		// cannot be that backstop: it measures from the start of the CURRENT frame, so it padded
+		// every retro_run to a full period, and the frontend's own vsync/audio wait then came on
+		// top of it - about 50 fps in an idle level on a Raspberry Pi 5, less wherever the GPU
+		// had work the limiter had already refused to overlap with. It stays off whatever the
+		// "Max FPS" preference says
+		_appCfg.frameLimit = 0;
 		SetFrameLimiter(true);
 		_appCfg.withVSync = false;
 
@@ -73,6 +80,25 @@ namespace nCine::Backends
 
 	void LibretroApplication::RunFrame()
 	{
+		if (_frameLimiterEnabled) {
+			// Measured from the start of the PREVIOUS run, so whatever the frontend waited on between the
+			// two (vsync, audio sync, its frame delay) counts toward the period instead of adding to it - a
+			// throttled frontend never arrives early enough to sleep here. The tolerance is for a display
+			// running a hair above its nominal rate, which a limiter at exactly the period would hold back
+			// to a dropped frame every few seconds; an unthrottled frontend is still caught, it would be
+			// here many times too early. A coarse sleep covers the bulk, Sleep(0) yields away the last bit
+			constexpr float ToleranceSecs = 0.001f;
+			const float period = 1.0f / (float)LibretroGfxDevice::GetTargetFps() - ToleranceSecs;
+			const float remaining = period - _lastRunStart.secondsSince();
+			if (remaining > 0.002f) {
+				Thread::Sleep((std::uint32_t)((remaining - 0.002f) * 1000.0f));
+			}
+			while (_lastRunStart.secondsSince() < period) {
+				Thread::Sleep(0);
+			}
+		}
+		_lastRunStart = TimeStamp::now();
+
 		static_cast<LibretroGfxDevice&>(*_gfxDevice).beginFrame();
 		static_cast<LibretroInputManager&>(*_inputManager).processFrame();
 		Step();
@@ -80,7 +106,7 @@ namespace nCine::Backends
 
 	void LibretroApplication::SetFrameLimiter(bool enabled)
 	{
-		_appCfg.frameLimit = (enabled ? (std::uint32_t)(LibretroGfxDevice::GetTargetFps() + 0.5) : 0);
+		_frameLimiterEnabled = enabled;
 	}
 
 	void LibretroApplication::Shutdown()

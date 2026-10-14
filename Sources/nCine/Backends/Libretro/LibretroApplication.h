@@ -3,6 +3,7 @@
 #if defined(WITH_LIBRETRO) || defined(DOXYGEN_GENERATING_OUTPUT)
 
 #include "../../Application.h"
+#include "../../Base/TimeStamp.h"
 
 #include <libretro/libretro.h>
 
@@ -52,7 +53,7 @@ namespace nCine::Backends
 		/** @brief Shuts the engine down, it cannot be initialized again afterwards */
 		void Shutdown();
 
-		/** @brief Enables or disables the internal frame limiter */
+		/** @brief Enables or disables the frame limiter, a backstop for a frontend that does not pace @ref RunFrame() itself */
 		void SetFrameLimiter(bool enabled);
 
 		/** @brief Writes a snapshot of the current session to a stream, see @ref IAppEventHandler::OnSaveState() */
@@ -71,6 +72,8 @@ namespace nCine::Backends
 
 	private:
 		HostPaths _hostPaths;
+		TimeStamp _lastRunStart;
+		bool _frameLimiterEnabled = false;
 	};
 
 	/** @brief Returns the application instance driven by the libretro frontend */
