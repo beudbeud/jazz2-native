@@ -4,7 +4,8 @@
 #endif
 #include "../Shaders/Generated/ShadersGen.h"
 #include "Compatibility/JJ2Anims.Palettes.h"
-#include "LevelFormat.h"
+#include "Formats/LevelFile.h"
+#include "Formats/TileSetFile.h"
 #include "LevelHandler.h"
 #include "Tiles/TileSet.h"
 #include "Compatibility/AssetConverter.h"
@@ -242,6 +243,41 @@ namespace Jazz2
 #endif
 	}
 
+	StringView ContentResolver::GetUserContentPath() const
+	{
+#if defined(DEATH_TARGET_ANDROID) || defined(DEATH_TARGET_APPLE) || defined(DEATH_TARGET_UNIX) || defined(DEATH_TARGET_WINDOWS_RT) || \
+		defined(DEATH_TARGET_SWITCH) || defined(DEATH_TARGET_VITA)
+		return _userContentPath;
+#else
+		// "Content" is already where the user can reach it, or nothing next to it is writable
+		return {};
+#endif
+	}
+
+	String ContentResolver::FindContentFile(StringView path) const
+	{
+		String fullPath;
+		StringView userContentPath = GetUserContentPath();
+		if (!userContentPath.empty()) {
+			fullPath = fs::CombinePath(userContentPath, path);
+			if (fs::IsReadableFile(fullPath)) {
+				return fullPath;
+			}
+		}
+
+		fullPath = fs::CombinePath(GetContentPath(), path);
+		if (fs::IsReadableFile(fullPath)) {
+			return fullPath;
+		}
+
+		fullPath = fs::CombinePath(GetCachePath(), path);
+		if (fs::IsReadableFile(fullPath)) {
+			return fullPath;
+		}
+
+		return {};
+	}
+
 	StringView ContentResolver::GetCachePath() const
 	{
 #if defined(DEATH_TARGET_ANDROID) || defined(DEATH_TARGET_APPLE) || defined(DEATH_TARGET_UNIX) || defined(DEATH_TARGET_WINDOWS_RT)
@@ -336,6 +372,7 @@ namespace Jazz2
 		_sourcePath = sourcePath;
 		_cachePath = cachePath;
 		DetectPrebakedContent();
+		DetectUserContent();
 		// The constructor already mounted .paks from the default paths, remount from the new ones
 		RemountPaks();
 	}
@@ -650,6 +687,7 @@ namespace Jazz2
 #endif
 
 		DetectPrebakedContent();
+		DetectUserContent();
 
 #if !defined(DEATH_TARGET_EMSCRIPTEN)
 		RemountPaks();
@@ -666,61 +704,155 @@ namespace Jazz2
 		}
 	}
 
+	String ContentResolver::GetUserContentCandidate() const
+	{
+#if defined(DEATH_TARGET_ANDROID) || defined(DEATH_TARGET_APPLE) || defined(DEATH_TARGET_UNIX) || defined(DEATH_TARGET_WINDOWS_RT) || \
+		defined(DEATH_TARGET_SWITCH) || defined(DEATH_TARGET_VITA)
+		// "Content" is packed inside the application on these platforms (APK assets, app bundle, AppImage mount, system
+		// prefix, UWP package, RomFS, VPK), so nothing can be added to it or replaced in it. The directory with "Cache"
+		// is the one place the user can always reach, so custom content goes to "Content" next to it, which then has
+		// priority over everything. Except on iOS, where "Cache" is in "Library/Caches", and "Documents" with "Source"
+		// is what the Files app exposes instead.
+#	if defined(DEATH_TARGET_IOS)
+		StringView userBase = fs::GetDirectoryName(GetSourcePath());
+#	else
+		StringView userBase = fs::GetDirectoryName(GetCachePath());
+#	endif
+#	if defined(DEATH_TARGET_WINDOWS_RT)
+		String userContentPath = fs::CombinePath(userBase, "Content\\"_s);
+#	else
+		String userContentPath = fs::CombinePath(userBase, "Content/"_s);
+#	endif
+		// A portable Linux copy (or relative fallback paths) already has "Content" next to "Cache", so it's the same one
+		if (userContentPath != GetContentPath()) {
+			return userContentPath;
+		}
+#endif
+		return {};
+	}
+
+	void ContentResolver::DetectUserContent()
+	{
+#if defined(DEATH_TARGET_ANDROID) || defined(DEATH_TARGET_APPLE) || defined(DEATH_TARGET_UNIX) || defined(DEATH_TARGET_WINDOWS_RT) || \
+		defined(DEATH_TARGET_SWITCH) || defined(DEATH_TARGET_VITA)
+		String userContentPath = GetUserContentCandidate();
+		if (!userContentPath.empty() && fs::DirectoryExists(userContentPath)) {
+			LOGI("Using also user content from \"{}\"", userContentPath);
+			_userContentPath = Death::move(userContentPath);
+		} else {
+			_userContentPath = {};
+		}
+#endif
+	}
+
+	StringView ContentResolver::GetWritableContentPath(bool create)
+	{
+#if defined(DEATH_TARGET_EMSCRIPTEN)
+		// The file system of the web is gone with the page, a file is downloaded instead
+		static_cast<void>(create);
+		return {};
+#else
+#	if defined(DEATH_TARGET_ANDROID) || defined(DEATH_TARGET_APPLE) || defined(DEATH_TARGET_UNIX) || defined(DEATH_TARGET_WINDOWS_RT) || \
+		defined(DEATH_TARGET_SWITCH) || defined(DEATH_TARGET_VITA)
+		if (!_userContentPath.empty()) {
+			return _userContentPath;
+		}
+		String userContentPath = GetUserContentCandidate();
+		if (create && !userContentPath.empty() && fs::CreateDirectories(userContentPath)) {
+			LOGI("Created user content directory \"{}\"", userContentPath);
+			_userContentPath = Death::move(userContentPath);
+			// Packages in it are now searched first as well
+			RemountPaks();
+			return _userContentPath;
+		}
+#	else
+		static_cast<void>(create);
+#	endif
+		// Where it's not part of the application package, the content itself can be written to, in a portable copy
+		StringView contentPath = GetContentPath();
+		if (fs::IsWritable(contentPath)) {
+			return contentPath;
+		}
+		return {};
+#endif
+	}
+
 #if !defined(DEATH_TARGET_EMSCRIPTEN)
 	void ContentResolver::RemountPaks()
 	{
 		// Unload all already loaded .paks
 		_mountedPaks.clear();
 
-		// Load all .paks from `Content` and `Cache` directory
-		for (auto item : fs::Directory(GetContentPath(), fs::EnumerationOptions::SkipDirectories)) {
-			auto extension = fs::GetExtension(item);
-			if (extension != "pak"_s) {
-				continue;
-			}
+		// Load all .paks from user `Content`, `Content` and `Cache` directory, in order of priority
+		auto mountPaksIn = [this](StringView path) {
+			for (auto item : fs::Directory(path, fs::EnumerationOptions::SkipDirectories)) {
+				auto extension = fs::GetExtension(item);
+				if (extension != "pak"_s) {
+					continue;
+				}
 
-			auto& pak = _mountedPaks.emplace_back(std::make_unique<PakFile>(item));
-			if (pak->IsValid()) {
-				LOGI("File \"{}\" mounted successfully", item);
-			} else {
-				LOGE("Failed to mount file \"{}\"", item);
-				_mountedPaks.pop_back();
+				auto& pak = _mountedPaks.emplace_back(std::make_unique<PakFile>(item));
+				if (pak->IsValid()) {
+					LOGI("File \"{}\" mounted successfully", item);
+				} else {
+					LOGE("Failed to mount file \"{}\"", item);
+					_mountedPaks.pop_back();
+				}
 			}
+		};
+
+		StringView userContentPath = GetUserContentPath();
+		if (!userContentPath.empty()) {
+			mountPaksIn(userContentPath);
 		}
-
-		for (auto item : fs::Directory(GetCachePath(), fs::EnumerationOptions::SkipDirectories)) {
-			auto extension = fs::GetExtension(item);
-			if (extension != "pak"_s) {
-				continue;
-			}
-
-			auto& pak = _mountedPaks.emplace_back(std::make_unique<PakFile>(item));
-			if (pak->IsValid()) {
-				LOGI("File \"{}\" mounted successfully", item);
-			} else {
-				LOGE("Failed to mount file \"{}\"", item);
-				_mountedPaks.pop_back();
-			}
-		}
+		_userPakCount = _mountedPaks.size();
+		mountPaksIn(GetContentPath());
+		mountPaksIn(GetCachePath());
 	}
 #endif
 
 	std::unique_ptr<Stream> ContentResolver::OpenContentFile(StringView path, std::int32_t bufferSize)
 	{
-		// Search .paks first, then Content directory and Cache directory
+		// The user Content directory (its .paks, then its files) has priority over everything, so it can replace
+		// any shipped file. Then the remaining .paks are searched, then Content directory and Cache directory.
 #if !defined(DEATH_TARGET_EMSCRIPTEN)
-		for (std::size_t i = 0; i < _mountedPaks.size(); i++) {
-			auto mountPoint = _mountedPaks[i]->GetMountPoint();
-			if (path.hasPrefix(mountPoint)) {
-				auto packedFile = _mountedPaks[i]->OpenFile(path.exceptPrefix(mountPoint.size()), bufferSize);
-				if (packedFile != nullptr && packedFile->IsValid()) {
-					return packedFile;
+		auto openFromPaks = [&](std::size_t from, std::size_t to) -> std::unique_ptr<Stream> {
+			for (std::size_t i = from; i < to; i++) {
+				auto mountPoint = _mountedPaks[i]->GetMountPoint();
+				if (path.hasPrefix(mountPoint)) {
+					auto packedFile = _mountedPaks[i]->OpenFile(path.exceptPrefix(mountPoint.size()), bufferSize);
+					if (packedFile != nullptr && packedFile->IsValid()) {
+						return packedFile;
+					}
 				}
 			}
+			return nullptr;
+		};
+
+		if (auto packedFile = openFromPaks(0, _userPakCount)) {
+			return packedFile;
 		}
 #endif
 
-		String fullPath = fs::CombinePath(GetContentPath(), path);
+		String fullPath;
+		StringView userContentPath = GetUserContentPath();
+		if (!userContentPath.empty()) {
+			fullPath = fs::CombinePath(userContentPath, path);
+			if (fs::IsReadableFile(fullPath)) {
+				auto realFile = fs::Open(fullPath, FileAccess::Read, bufferSize);
+				if (realFile->IsValid()) {
+					return realFile;
+				}
+			}
+		}
+
+#if !defined(DEATH_TARGET_EMSCRIPTEN)
+		if (auto packedFile = openFromPaks(_userPakCount, _mountedPaks.size())) {
+			return packedFile;
+		}
+#endif
+
+		fullPath = fs::CombinePath(GetContentPath(), path);
 		if (fs::IsReadableFile(fullPath)) {
 			auto realFile = fs::Open(fullPath, FileAccess::Read, bufferSize);
 			if (realFile->IsValid()) {
@@ -786,6 +918,13 @@ namespace Jazz2
 		std::int32_t animationsKept = 0, animationsReleased = 0;
 		std::int32_t soundsKept = 0, soundsReleased = 0;
 #endif
+
+		// Pinned metadata stays with everything it uses, whatever was requested in the meantime (see PinMetadata())
+		for (auto& resource : _cachedMetadata) {
+			if ((resource.second->Flags & MetadataFlags::Pinned) == MetadataFlags::Pinned) {
+				MarkReferenced(*resource.second);
+			}
+		}
 
 		// Release unreferenced metadata
 		{
@@ -864,6 +1003,39 @@ namespace Jazz2
 #endif
 	}
 
+	void ContentResolver::MarkReferenced(Metadata& metadata)
+	{
+		metadata.Flags |= MetadataFlags::Referenced;
+
+		for (const auto& resource : metadata.Animations) {
+			// Deferred animations that were never looked up have nothing to mark yet, the ones that were
+			// must be marked, because the metadata keeps pointing at them for as long as it stays cached
+			if (resource.Base != nullptr) {
+				resource.Base->Flags |= GenericGraphicResourceFlags::Referenced;
+			}
+		}
+
+#if defined(WITH_AUDIO)
+		for (const auto& [key, resource] : metadata.Sounds) {
+			for (const auto& base : resource.Buffers) {
+				base->Flags |= GenericSoundResourceFlags::Referenced;
+			}
+		}
+#endif
+	}
+
+	void ContentResolver::PinMetadata(Metadata* metadata, bool pinned)
+	{
+		if (metadata == nullptr) {
+			return;
+		}
+		if (pinned) {
+			metadata->Flags |= MetadataFlags::Pinned;
+		} else {
+			metadata->Flags &= ~MetadataFlags::Pinned;
+		}
+	}
+
 	void ContentResolver::OverridePathHandler(Function<String(StringView)>&& callback)
 	{
 		_pathHandler = std::move(callback);
@@ -885,24 +1057,7 @@ namespace Jazz2
 		auto it = _cachedMetadata.find(cacheKey);
 		if (it != _cachedMetadata.end()) {
 			// Already loaded - Mark as referenced
-			it->second->Flags |= MetadataFlags::Referenced;
-
-			for (const auto& resource : it->second->Animations) {
-				// Deferred animations that were never looked up have nothing to mark yet, the ones that were
-				// must be marked, because the metadata keeps pointing at them for as long as it stays cached
-				if (resource.Base != nullptr) {
-					resource.Base->Flags |= GenericGraphicResourceFlags::Referenced;
-				}
-			}
-
-#if defined(WITH_AUDIO)
-			for (const auto& [key, resource] : it->second->Sounds) {
-				for (const auto& base : resource.Buffers) {
-					base->Flags |= GenericSoundResourceFlags::Referenced;
-				}
-			}
-#endif
-
+			MarkReferenced(*it->second);
 			return it->second.get();
 		}
 
@@ -1822,15 +1977,15 @@ namespace Jazz2
 	std::unique_ptr<Tiles::TileSet> ContentResolver::RequestTileSet(StringView path, std::uint16_t captionTileId, bool applyPalette, const std::uint8_t* paletteRemapping,
 		const BitArray* usedTiles, bool withDiffuse)
 	{
-		// Try "Content" directory first, then "Cache" directory
+		// Try user "Content" directory first, then "Content" directory and "Cache" directory
 		String fullPath;
 		if (_pathHandler) {
 			fullPath = _pathHandler(String(path + ".j2t"_s));
 		}
 		if (fullPath.empty()) {
-			fullPath = fs::CombinePath({ GetContentPath(), "Tilesets"_s, String(path + ".j2t"_s) });
-			if (!fs::IsReadableFile(fullPath)) {
-				fullPath = fs::CombinePath({ GetCachePath(), "Tilesets"_s, String(path + ".j2t"_s) });
+			fullPath = FindContentFile(fs::CombinePath("Tilesets"_s, String(path + ".j2t"_s)));
+			if (fullPath.empty()) {
+				return nullptr;
 			}
 		}
 
@@ -1839,22 +1994,27 @@ namespace Jazz2
 			return nullptr;
 		}
 
-		std::uint64_t signature1 = s->ReadValueAsLE<std::uint64_t>();
-		std::uint16_t signature2 = s->ReadValueAsLE<std::uint16_t>();
-		std::uint8_t version = s->ReadValue<std::uint8_t>();
-		const std::uint8_t flags = s->ReadValue<std::uint8_t>();
-		DEATH_ASSERT(signature1 == 0xB8EF8498E2BFBBEF && signature2 == 0x208F && version == 2,
-			("Tile set \"{}\" has invalid signature", fullPath), nullptr);
+		return RequestTileSet(*s, path, captionTileId, applyPalette, paletteRemapping, usedTiles, withDiffuse);
+	}
 
-		std::uint8_t channelCount = s->ReadValue<std::uint8_t>();
-		std::uint32_t width = s->ReadValueAsLE<std::uint32_t>();
-		std::uint32_t height = s->ReadValueAsLE<std::uint32_t>();
-		std::uint16_t tileCount = s->ReadValueAsLE<std::uint16_t>();
+	std::unique_ptr<Tiles::TileSet> ContentResolver::RequestTileSet(Stream& s, StringView path, std::uint16_t captionTileId, bool applyPalette,
+		const std::uint8_t* paletteRemapping, const BitArray* usedTiles, bool withDiffuse)
+	{
+		// Read outside of an assert, which isn't evaluated at all in builds without them
+		Formats::TileSetHeader header;
+		if (!Formats::TileSetFile::ReadHeader(s, header)) {
+			LOGE("Tile set \"{}\" has invalid signature", path);
+			return nullptr;
+		}
+
+		const std::uint8_t flags = header.Flags;
+		std::uint8_t channelCount = header.ChannelCount;
+		std::uint32_t width = header.Width;
+		std::uint32_t height = header.Height;
+		std::uint16_t tileCount = header.TileCount;
 
 		// Read compressed palette and mask
-		std::int32_t compressedSize = s->ReadValueAsLE<std::int32_t>();
-
-		DeflateStream uc(*s, compressedSize);
+		DeflateStream uc(s, header.BodySize);
 
 		ReadTilesetPalette(uc, applyPalette);
 
@@ -1870,6 +2030,12 @@ namespace Jazz2
 		// Mask (kept packed, 1 bit per pixel - see ReadTilesetMask)
 		std::uint32_t maskSize;
 		std::unique_ptr<std::uint8_t[]> mask = ReadTilesetMask(uc, maskSize);
+		if (!uc.IsValid()) {
+			return nullptr;
+		}
+		// The image content follows the compressed block, the stream is moved past it in case the decompression didn't
+		// get to its end marker yet
+		uc.CeaseReading();
 
 		SmallVector<std::unique_ptr<Texture>, 1> textureDiffuse;
 		std::unique_ptr<Color[]> captionTile;
@@ -1885,8 +2051,9 @@ namespace Jazz2
 
 		// The image content follows the compressed block, so it's read from the raw stream (headless builds masks only)
 		if (!_isHeadless && withDiffuse) {
-			const bool lz4Content = ((flags & Compatibility::JJ2Anims::ImageContentLz4Flag) == Compatibility::JJ2Anims::ImageContentLz4Flag);
-			textureDiffuse = BuildTilesetDiffuse(s, fullPath.data(), channelCount, lz4Content, usedTiles, atlasSlot, width, height, tileCount,
+			const bool lz4Content = ((flags & Formats::TileSetFile::ImageLz4) == Formats::TileSetFile::ImageLz4);
+			String name = path;
+			textureDiffuse = BuildTilesetDiffuse(s, name.data(), channelCount, lz4Content, usedTiles, atlasSlot, width, height, tileCount,
 				is32bitTile.get(), paletteRemapping, captionTileId, indexTiles, tileDiffuseOpaque, tileEffectInfo, captionTile);
 		}
 
@@ -1983,7 +2150,7 @@ namespace Jazz2
 	}
 #endif
 
-	SmallVector<std::unique_ptr<Texture>, 1> ContentResolver::BuildTilesetDiffuse(std::unique_ptr<Stream>& s, const char* name, std::uint8_t channelCount,
+	SmallVector<std::unique_ptr<Texture>, 1> ContentResolver::BuildTilesetDiffuse(Stream& s, const char* name, std::uint8_t channelCount,
 		bool lz4Content, const BitArray* usedTiles, std::unique_ptr<std::uint16_t[]>& atlasSlot,
 		std::uint32_t width, std::uint32_t height, std::uint16_t tileCount, const std::uint8_t* is32bitTile,
 		const std::uint8_t* paletteRemapping, std::uint16_t captionTileId, bool& indexTiles,
@@ -2030,11 +2197,11 @@ namespace Jazz2
 		const std::uint8_t* sheetSrc = nullptr;
 		const std::uint8_t* sheetEnd = nullptr;
 		{
-			const std::int64_t remaining = s->GetSize() - s->GetPosition();
+			const std::int64_t remaining = s.GetSize() - s.GetPosition();
 			if (remaining > 0 && remaining <= 2 * 1024 * 1024) {
 				sheetData.reset(new (std::nothrow) std::uint8_t[std::size_t(remaining)]);
 				if (sheetData != nullptr) {
-					if (s->Read(sheetData.get(), remaining) == remaining) {
+					if (s.Read(sheetData.get(), remaining) == remaining) {
 						sheetSrc = sheetData.get();
 						sheetEnd = sheetSrc + remaining;
 					} else {
@@ -2080,7 +2247,7 @@ namespace Jazz2
 #if defined(WITH_LZ4)
 					const bool decoded = (sheetData != nullptr
 						? Compatibility::JJ2Anims::DecodeImageContentLz4(sheetSrc, sheetEnd, sheetBand.get(), bandBytes)
-						: Compatibility::JJ2Anims::ReadImageContentLz4(*s, sheetBand.get(), bandBytes));
+						: Compatibility::JJ2Anims::ReadImageContentLz4(s, sheetBand.get(), bandBytes));
 #else
 					const bool decoded = false;
 #endif
@@ -2098,7 +2265,7 @@ namespace Jazz2
 				} else if (sheetData != nullptr) {
 					sheetDecoder.Decode(sheetSrc, sheetEnd, sheetBand.get(), std::int32_t(rows * width), channelCount);
 				} else {
-					sheetDecoder.Decode(*s, sheetBand.get(), std::int32_t(rows * width), channelCount);
+					sheetDecoder.Decode(s, sheetBand.get(), std::int32_t(rows * width), channelCount);
 				}
 				if (sheetBandIndex == captionBand) {
 					extractCaptionTile();
@@ -2398,24 +2565,23 @@ namespace Jazz2
 
 	bool ContentResolver::LevelExists(StringView levelName)
 	{
-		// Try "Content" directory first, then "Cache" directory
+		// Try user "Content" directory first, then "Content" directory and "Cache" directory
 		auto pathNormalized = fs::ToNativeSeparators(levelName);
-		return (fs::IsReadableFile(fs::CombinePath({ GetContentPath(), "Episodes"_s, String(pathNormalized + ".j2l"_s) })) ||
-				fs::IsReadableFile(fs::CombinePath({ GetCachePath(), "Episodes"_s, String(pathNormalized + ".j2l"_s) })));
+		return !FindContentFile(fs::CombinePath("Episodes"_s, String(pathNormalized + ".j2l"_s))).empty();
 	}
 
 	bool ContentResolver::TryGetNextLevelName(StringView path, String& nextLevel)
 	{
-		// Try "Content" directory first, then "Cache" directory, the same way as TryLoadLevel()
+		// Try user "Content" directory first, then "Content" directory and "Cache" directory, the same way as TryLoadLevel()
 		auto pathNormalized = fs::ToNativeSeparators(path);
 		String fullPath;
 		if (_pathHandler) {
 			fullPath = _pathHandler(String(pathNormalized + ".j2l"_s));
 		}
 		if (fullPath.empty()) {
-			fullPath = fs::CombinePath({ GetContentPath(), "Episodes"_s, String(pathNormalized + ".j2l"_s) });
-			if (!fs::IsReadableFile(fullPath)) {
-				fullPath = fs::CombinePath({ GetCachePath(), "Episodes"_s, String(pathNormalized + ".j2l"_s) });
+			fullPath = FindContentFile(fs::CombinePath("Episodes"_s, String(pathNormalized + ".j2l"_s)));
+			if (fullPath.empty()) {
+				return false;
 			}
 		}
 
@@ -2424,160 +2590,118 @@ namespace Jazz2
 			return false;
 		}
 
-		LevelFlags flags;
-		if (!LevelFormat::ReadHeader(*s, flags)) {
+		Formats::LevelHeader header;
+		if (!Formats::LevelFile::ReadHeader(*s, header)) {
 			return false;
 		}
 
-		std::int32_t compressedSize = s->ReadValueAsLE<std::int32_t>();
-		DeflateStream uc(*s, compressedSize);
+		// The properties come first, so nothing else has to be read
+		Formats::LevelReader reader(*s, header);
+		Formats::LevelProperties properties;
+		reader.ReadProperties(properties);
+		if (!reader.IsValid()) {
+			return false;
+		}
 
-		// Display name comes first
-		char displayName[UINT8_MAX];
-		std::uint8_t stringSize = uc.ReadValue<std::uint8_t>();
-		uc.Read(displayName, stringSize);
-
-		stringSize = uc.ReadValue<std::uint8_t>();
-		nextLevel = String(NoInit, stringSize);
-		uc.Read(nextLevel.data(), stringSize);
+		nextLevel = std::move(properties.NextLevel);
 		return true;
 	}
 
-	bool ContentResolver::TryLoadLevel(StringView path, GameDifficulty difficulty, LevelDescriptor& descriptor)
+	bool ContentResolver::TryLoadLevel(StringView path, const LevelLoadOptions& options, LevelDescriptor& descriptor)
 	{
-		// Try "Content" directory first, then "Cache" directory
+		// Try user "Content" directory first, then "Content" directory and "Cache" directory
 		auto pathNormalized = fs::ToNativeSeparators(path);
+		String fullPath;
 		if (_pathHandler) {
-			descriptor.FullPath = _pathHandler(String(pathNormalized + ".j2l"_s));
+			fullPath = _pathHandler(String(pathNormalized + ".j2l"_s));
 		}
-		if (descriptor.FullPath.empty()) {
-			descriptor.FullPath = fs::CombinePath({ GetContentPath(), "Episodes"_s, String(pathNormalized + ".j2l"_s) });
-			if (!fs::IsReadableFile(descriptor.FullPath)) {
-				descriptor.FullPath = fs::CombinePath({ GetCachePath(), "Episodes"_s, String(pathNormalized + ".j2l"_s) });
+		if (fullPath.empty()) {
+			fullPath = FindContentFile(fs::CombinePath("Episodes"_s, String(pathNormalized + ".j2l"_s)));
+			if (fullPath.empty()) {
+				return false;
 			}
 		}
 
-		auto s = fs::Open(descriptor.FullPath, FileAccess::Read, 16 * 1024);
-		if (!s->IsValid()) return false;
-
-		LevelFlags flags;
-		if (!LevelFormat::ReadHeader(*s, flags)) {
-			// A level converted by another version of the game (the cache is rebuilt when the version changes, see
-			// JJ2Anims::CacheVersion), or not a level at all
-			LOGE("Level \"{}\" has invalid signature or unsupported version", descriptor.FullPath);
+		auto s = fs::Open(fullPath, FileAccess::Read, 16 * 1024);
+		if (!s->IsValid()) {
 			return false;
 		}
 
-		// Read compressed data
-		std::int32_t compressedSize = s->ReadValueAsLE<std::int32_t>();
+		return TryLoadLevel(*s, fullPath, options, descriptor);
+	}
 
-		DeflateStream uc(*s, compressedSize);
+	bool ContentResolver::TryLoadLevel(Stream& s, StringView fullPath, const LevelLoadOptions& options, LevelDescriptor& descriptor)
+	{
+		descriptor.FullPath = fullPath;
+
+		Formats::LevelHeader header;
+		if (!Formats::LevelFile::ReadHeader(s, header)) {
+			// A level converted by another version of the game (the cache is rebuilt when the version changes, see
+			// JJ2Anims::CacheVersion), or not a level at all
+			LOGE("Level \"{}\" has invalid signature or unsupported version", fullPath);
+			return false;
+		}
+
+		Formats::LevelReader reader(s, header);
 
 		// Read metadata
-		std::uint8_t stringSize = uc.ReadValue<std::uint8_t>();
-		descriptor.DisplayName = String(NoInit, stringSize);
-		uc.Read(descriptor.DisplayName.data(), stringSize);
+		Formats::LevelProperties properties;
+		reader.ReadProperties(properties);
 
-		stringSize = uc.ReadValue<std::uint8_t>();
-		descriptor.NextLevel = String(NoInit, stringSize);
-		uc.Read(descriptor.NextLevel.data(), stringSize);
+		descriptor.DisplayName = std::move(properties.DisplayName);
+		descriptor.NextLevel = std::move(properties.NextLevel);
+		descriptor.SecretLevel = std::move(properties.SecretLevel);
+		descriptor.BonusLevel = std::move(properties.BonusLevel);
+		descriptor.MusicPath = std::move(properties.Music);
 
-		stringSize = uc.ReadValue<std::uint8_t>();
-		descriptor.SecretLevel = String(NoInit, stringSize);
-		uc.Read(descriptor.SecretLevel.data(), stringSize);
-
-		stringSize = uc.ReadValue<std::uint8_t>();
-		descriptor.BonusLevel = String(NoInit, stringSize);
-		uc.Read(descriptor.BonusLevel.data(), stringSize);
-
-		// Default Tileset
-		stringSize = uc.ReadValue<std::uint8_t>();
-		String defaultTileset(NoInit, stringSize);
-		uc.Read(defaultTileset.data(), stringSize);
-
-		// Default Music
-		stringSize = uc.ReadValue<std::uint8_t>();
-		descriptor.MusicPath = String(NoInit, stringSize);
-		uc.Read(descriptor.MusicPath.data(), stringSize);
-
-		uint32_t rawAmbientColor = uc.ReadValueAsLE<std::uint32_t>();
+		std::uint32_t rawAmbientColor = properties.AmbientColor;
 		descriptor.AmbientColor = Vector4f((rawAmbientColor & 0xff) / 255.0f, ((rawAmbientColor >> 8) & 0xff) / 255.0f,
 			((rawAmbientColor >> 16) & 0xff) / 255.0f, ((rawAmbientColor >> 24) & 0xff) / 255.0f);
 
-		descriptor.Weather = (WeatherType)uc.ReadValue<std::uint8_t>();
-		descriptor.WeatherIntensity = uc.ReadValue<std::uint8_t>();
-		descriptor.WaterLevel = uc.ReadValueAsLE<std::uint16_t>();
-
-		std::uint16_t captionTileId = uc.ReadValueAsLE<std::uint16_t>();
+		descriptor.Weather = (WeatherType)properties.Weather;
+		descriptor.WeatherIntensity = properties.WeatherIntensity;
+		descriptor.WaterLevel = properties.WaterLevel;
+		descriptor.Editable = ((header.Flags & LevelFlags::NotEditable) != LevelFlags::NotEditable);
 
 		PitType pitType;
-		if ((flags & LevelFlags::HasPit) == LevelFlags::HasPit) {
-			pitType = ((flags & LevelFlags::HasPitInstantDeath) == LevelFlags::HasPitInstantDeath ? PitType::InstantDeathPit : PitType::FallForever);
+		if ((header.Flags & LevelFlags::HasPit) == LevelFlags::HasPit) {
+			pitType = ((header.Flags & LevelFlags::HasPitInstantDeath) == LevelFlags::HasPitInstantDeath ? PitType::InstantDeathPit : PitType::FallForever);
 		} else {
 			pitType = PitType::StandOnPlatform;
 		}
 
-		bool hasCustomPalette = ((flags & LevelFlags::UseLevelPalette) == LevelFlags::UseLevelPalette);
-		if (hasCustomPalette) {
-			std::uint32_t newPalette[ColorsPerPalette];
-			for (std::size_t i = 0; i < arraySize(newPalette); i++) {
-				newPalette[i] = uc.ReadValueAsLE<std::uint32_t>();
+		// TODO: Store and use the additional palettes (if not headless)
+		std::uint32_t newPalette[ColorsPerPalette];
+		bool hasCustomPalette = reader.ReadPalettes(newPalette, nullptr);
+		if (hasCustomPalette && !_isHeadless && std::memcmp(_palettes, newPalette, ColorsPerPalette * sizeof(std::uint32_t)) != 0) {
+			// Palettes differs, drop all cached resources, so it will be reloaded with new palette
+			if (_isLoading) {
+				// Indexed sprites/tiles recolor from the live palette texture and need no reload; only the baked
+				// fonts are dropped to rebake with the new palette
+				DropBakedFonts();
 			}
 
-			if (!_isHeadless && std::memcmp(_palettes, newPalette, ColorsPerPalette * sizeof(std::uint32_t)) != 0) {
-				// Palettes differs, drop all cached resources, so it will be reloaded with new palette
-				if (_isLoading) {
-					// Indexed sprites/tiles recolor from the live palette texture and need no reload; only the baked
-					// fonts are dropped to rebake with the new palette
-					DropBakedFonts();
-				}
-
-				std::memcpy(_palettes, newPalette, ColorsPerPalette * sizeof(std::uint32_t));
-				RecreateGemPalettes();
-			}
+			std::memcpy(_palettes, newPalette, ColorsPerPalette * sizeof(std::uint32_t));
+			RecreateGemPalettes();
 		}
 
-		std::uint8_t additionalPaletteCount = uc.ReadValue<std::uint8_t>();
-		for (std::int32_t i = 0; i < additionalPaletteCount; i++) {
-			std::uint8_t nameLength = uc.ReadValue<std::uint8_t>();
-			String name(NoInit, nameLength);
-			uc.Read(name.data(), nameLength);
-			std::uint32_t palette[ColorsPerPalette];
-			for (std::size_t i = 0; i < arraySize(palette); i++) {
-				palette[i] = uc.ReadValueAsLE<std::uint32_t>();
-			}
-
-			// TODO: Store and use the palette (if not headless)
-		}
-
-		descriptor.TileMap = std::make_unique<Tiles::TileMap>(defaultTileset, captionTileId, !hasCustomPalette);
+		descriptor.TileMap = std::make_unique<Tiles::TileMap>(properties.DefaultTileSet, properties.CaptionTileId, !hasCustomPalette);
 		descriptor.TileMap->SetPitType(pitType);
 
 		// Extra Tilesets
-		std::uint8_t extraTilesetCount = uc.ReadValue<std::uint8_t>();
-		for (std::uint32_t i = 0; i < extraTilesetCount; i++) {
-			std::uint8_t tilesetFlags = uc.ReadValue<std::uint8_t>();
-
-			stringSize = uc.ReadValue<std::uint8_t>();
-			String extraTileset{NoInit, stringSize};
-			uc.Read(extraTileset.data(), stringSize);
-
-			std::uint16_t offset = uc.ReadValueAsLE<std::uint16_t>();
-			std::uint16_t count = uc.ReadValueAsLE<std::uint16_t>();
-
-			std::uint8_t paletteRemapping[ColorsPerPalette];
-			bool isRemapped = ((tilesetFlags & 0x01) == 0x01);
-			bool is24bit = ((tilesetFlags & 0x02) == 0x02);
-			if (isRemapped) {
-				if (is24bit) {
-					// Alternate palette index
-					paletteRemapping[0] = uc.ReadValue<std::uint8_t>();
-				} else {
-					uc.Read(paletteRemapping, sizeof(paletteRemapping));
-				}
+		SmallVector<Formats::ExtraTileSetRecord, 0> extraTileSets;
+		reader.ReadExtraTileSets(extraTileSets);
+		for (const Formats::ExtraTileSetRecord& tileSet : extraTileSets) {
+			// TODO: A true color tile set remapped to an additional palette is used as it is, only an 8-bit one is remapped
+			bool isRemapped = ((tileSet.Flags & Formats::ExtraTileSetRecord::Remapped) != 0 &&
+				(tileSet.Flags & Formats::ExtraTileSetRecord::TrueColor) == 0);
+			if ((tileSet.Flags & Formats::ExtraTileSetRecord::Embedded) != 0) {
+				// Tiles of the level itself, not in any tile set file
+				Death::IO::MemoryStream ms(tileSet.Data.data(), std::int64_t(tileSet.Data.size()));
+				descriptor.TileMap->AddTileSet(ms, tileSet.Name, tileSet.Offset, tileSet.Count, isRemapped ? tileSet.Remapping : nullptr);
+			} else {
+				descriptor.TileMap->AddTileSet(tileSet.Name, tileSet.Offset, tileSet.Count, isRemapped ? tileSet.Remapping : nullptr);
 			}
-
-			descriptor.TileMap->AddTileSet(extraTileset, offset, count, isRemapped ? paletteRemapping : nullptr);
 		}
 
 		if (!descriptor.TileMap->IsValid()) {
@@ -2586,71 +2710,48 @@ namespace Jazz2
 		}
 
 		// Overriden tiles (diffuse and mask)
-		std::uint32_t overridenTilesCount = uc.ReadVariableUint32();
 		if (!_isHeadless) {
-			for (std::uint32_t i = 0; i < overridenTilesCount; i++) {
-				std::uint16_t tileId = uc.ReadValueAsLE<std::uint16_t>();
-				std::uint8_t tileDiffuseRaw[TileSet::DefaultTileSize * TileSet::DefaultTileSize];
-				uc.Read(tileDiffuseRaw, sizeof(tileDiffuseRaw));
-
-				bool overrideIndexed = descriptor.TileMap->IsTileSetIndexed(tileId);
-					std::uint32_t tileDiffuse[TileSet::PaddedTileSize * TileSet::PaddedTileSize];
-				for (std::uint32_t y = 0; y < TileSet::DefaultTileSize; y++) {
-					for (std::uint32_t x = 0; x < TileSet::DefaultTileSize; x++) {
-						std::uint32_t from = y * TileSet::DefaultTileSize + x;
-						std::uint32_t to = (y + TileSet::TilePadding) * TileSet::PaddedTileSize + (x + TileSet::TilePadding);
-
-						// Store the palette index (with full alpha) for an indexed tileset; otherwise bake the color
-						std::uint32_t color = (overrideIndexed ? ((std::uint32_t)tileDiffuseRaw[from] | 0xFF000000u) : _palettes[tileDiffuseRaw[from]]);
-						tileDiffuse[to] = color;
-					}
-				}
-
-				ExpandTileDiffuse((std::uint8_t*)tileDiffuse, TileSet::PaddedTileSize, PixelSize);
-				descriptor.TileMap->OverrideTileDiffuse(tileId, tileDiffuse);
+			SmallVector<Formats::TileDiffuseOverride, 0> diffuseOverrides;
+			reader.ReadTileDiffuseOverrides(&diffuseOverrides);
+			for (const Formats::TileDiffuseOverride& tile : diffuseOverrides) {
+				ApplyTileDiffuseOverride(*descriptor.TileMap, tile.TileId, tile.Indices);
 			}
 		} else {
-			uc.Seek(overridenTilesCount * (2 + TileSet::DefaultTileSize * TileSet::DefaultTileSize), SeekOrigin::Current);
+			reader.ReadTileDiffuseOverrides(nullptr);
 		}
 
-		overridenTilesCount = uc.ReadVariableUint32();
-		for (std::uint32_t i = 0; i < overridenTilesCount; i++) {
-			std::uint16_t tileId = uc.ReadValueAsLE<std::uint16_t>();
-			std::uint8_t tileMask[32 * 32];
-			uc.Read(tileMask, sizeof(tileMask));
-
-			descriptor.TileMap->OverrideTileMask(tileId, tileMask);
+		SmallVector<Formats::TileMaskOverride, 0> maskOverrides;
+		reader.ReadTileMaskOverrides(&maskOverrides);
+		for (const Formats::TileMaskOverride& tile : maskOverrides) {
+			descriptor.TileMap->OverrideTileMask(tile.TileId, tile.Mask);
 		}
 
 		// Text Event Strings
-		std::uint8_t textEventStringsCount = uc.ReadValue<std::uint8_t>();
-		descriptor.LevelTexts.reserve(textEventStringsCount);
-		for (std::uint32_t i = 0; i < textEventStringsCount; i++) {
-			std::uint16_t textLength = uc.ReadValueAsLE<std::uint16_t>();
-			String& text = descriptor.LevelTexts.emplace_back(NoInit, textLength);
-			uc.Read(text.data(), textLength);
-		}
+		reader.ReadTexts(descriptor.LevelTexts);
 
 		// Animated Tiles
-		descriptor.TileMap->ReadAnimatedTiles(uc);
+		std::uint16_t animatedTilesOffset;
+		SmallVector<Formats::AnimatedTileRecord, 0> animatedTiles;
+		reader.ReadAnimatedTiles(animatedTilesOffset, animatedTiles);
+		descriptor.TileMap->SetAnimatedTiles(animatedTilesOffset, animatedTiles);
 
 		// Layers
-		std::uint8_t layerCount = uc.ReadValue<std::uint8_t>();
-		for (std::uint32_t i = 0; i < layerCount; i++) {
-			descriptor.TileMap->ReadLayerConfiguration(uc);
+		std::int32_t layerCount = reader.ReadLayerCount();
+		for (std::int32_t i = 0; i < layerCount; i++) {
+			descriptor.TileMap->LoadLayer(reader);
 		}
 		if (descriptor.TileMap->HasLoadFailed()) {
 			// Out of memory for a layer: the level cannot be played, and the caller shows why
-			LOGE("Cannot load level \"{}\": Out of memory for its layers", path);
+			LOGE("Cannot load level \"{}\": Out of memory for its layers", fullPath);
 			return false;
 		}
 
 		// Events
 		descriptor.EventMap = std::make_unique<Events::EventMap>(descriptor.TileMap->GetSize());
 		descriptor.EventMap->SetPitType(pitType);
-		descriptor.EventMap->ReadEvents(uc, descriptor.TileMap, difficulty);
+		descriptor.EventMap->LoadEvents(reader, *descriptor.TileMap, options);
 		if (descriptor.EventMap->HasLoadFailed()) {
-			LOGE("Cannot load level \"{}\": Out of memory for its events", path);
+			LOGE("Cannot load level \"{}\": Out of memory for its events", fullPath);
 			return false;
 		}
 
@@ -2658,7 +2759,10 @@ namespace Jazz2
 		// this level actually uses
 		descriptor.TileMap->PruneTilesetAtlas();
 
-		DEATH_ASSERT(uc.IsValid(), "File cannot be decompressed", false);
+		if (!reader.IsValid()) {
+			LOGE("Level \"{}\" cannot be read, the file is corrupted", fullPath);
+			return false;
+		}
 		return true;
 	}
 
@@ -2679,6 +2783,42 @@ namespace Jazz2
 		}
 	}
 
+	void ContentResolver::ApplyTileDiffuseOverride(Tiles::TileMap& tileMap, std::int32_t tileId, const std::uint8_t* indices)
+	{
+		bool overrideIndexed = tileMap.IsTileSetIndexed(tileId);
+		std::uint32_t tileDiffuse[TileSet::PaddedTileSize * TileSet::PaddedTileSize];
+		for (std::uint32_t y = 0; y < TileSet::DefaultTileSize; y++) {
+			for (std::uint32_t x = 0; x < TileSet::DefaultTileSize; x++) {
+				std::uint32_t from = y * TileSet::DefaultTileSize + x;
+				std::uint32_t to = (y + TileSet::TilePadding) * TileSet::PaddedTileSize + (x + TileSet::TilePadding);
+
+				// Store the palette index (with full alpha) for an indexed tileset; otherwise bake the color
+				std::uint32_t color = (overrideIndexed ? ((std::uint32_t)indices[from] | 0xFF000000u) : _palettes[indices[from]]);
+				tileDiffuse[to] = color;
+			}
+		}
+
+		ExpandTileDiffuse((std::uint8_t*)tileDiffuse, TileSet::PaddedTileSize, PixelSize);
+		tileMap.OverrideTileDiffuse(tileId, tileDiffuse);
+	}
+
+	bool ContentResolver::ApplyTileDiffuseOverrideRgba(Tiles::TileMap& tileMap, std::int32_t tileId, const std::uint8_t* rgba)
+	{
+		if (tileMap.IsTileSetIndexed(tileId)) {
+			return false;
+		}
+		std::uint32_t tileDiffuse[TileSet::PaddedTileSize * TileSet::PaddedTileSize];
+		for (std::uint32_t y = 0; y < TileSet::DefaultTileSize; y++) {
+			for (std::uint32_t x = 0; x < TileSet::DefaultTileSize; x++) {
+				const std::uint8_t* from = &rgba[(y * TileSet::DefaultTileSize + x) * 4];
+				std::uint32_t to = (y + TileSet::TilePadding) * TileSet::PaddedTileSize + (x + TileSet::TilePadding);
+				tileDiffuse[to] = std::uint32_t(from[0]) | (std::uint32_t(from[1]) << 8) | (std::uint32_t(from[2]) << 16) | (std::uint32_t(from[3]) << 24);
+			}
+		}
+		ExpandTileDiffuse((std::uint8_t*)tileDiffuse, TileSet::PaddedTileSize, PixelSize);
+		return tileMap.OverrideTileDiffuse(tileId, tileDiffuse);
+	}
+
 	void ContentResolver::SetSpritePalette(ArrayView<const std::uint32_t> palette)
 	{
 		std::int32_t paletteSize = (std::int32_t)palette.size();
@@ -2695,9 +2835,9 @@ namespace Jazz2
 
 	std::optional<Episode> ContentResolver::GetEpisode(StringView name, bool withImages)
 	{
-		String fullPath = fs::CombinePath({ GetContentPath(), "Episodes"_s, String(name + ".j2e"_s) });
-		if (!fs::IsReadableFile(fullPath)) {
-			fullPath = fs::CombinePath({ GetCachePath(), "Episodes"_s, String(name + ".j2e"_s) });
+		String fullPath = FindContentFile(fs::CombinePath("Episodes"_s, String(name + ".j2e"_s)));
+		if (fullPath.empty()) {
+			return std::nullopt;
 		}
 		return GetEpisodeByPath(fullPath, withImages);
 	}
@@ -2834,7 +2974,13 @@ namespace Jazz2
 				}
 			}
 #	else
-			fullPath = fs::CombinePath({ GetContentPath(), "Music"_s, path });
+			StringView userContentPath = GetUserContentPath();
+			if (!userContentPath.empty()) {
+				fullPath = fs::CombinePath({ userContentPath, "Music"_s, path });
+			}
+			if (!fs::IsReadableFile(fullPath)) {
+				fullPath = fs::CombinePath({ GetContentPath(), "Music"_s, path });
+			}
 			if (!fs::IsReadableFile(fullPath)) {
 				// "Source" directory must be case in-sensitive
 				fullPath = fs::FindPathCaseInsensitive(fs::CombinePath(GetSourcePath(), path));
